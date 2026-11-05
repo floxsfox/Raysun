@@ -1,0 +1,8 @@
+{
+  "type": "preload-native",
+  "name": "Ray Sun",
+  "author": "floxsfox",
+  "version": "1.0.0",
+  "entry": "libray_sun.so",
+  "minecraft_versions": []
+}
