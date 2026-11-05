@@ -1,0 +1,45 @@
+name: build-ray-sun
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout LeviLaunchroid (preloader SDK)
+        uses: actions/checkout@v4
+        with:
+          repository: LiteLDev/LeviLaunchroid
+          ref: v1.5.27
+          path: levilaunchroid
+          submodules: recursive
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPRELOADER_ANDROID_ROOT="$GITHUB_WORKSPACE/levilaunchroid/app/src/main/cpp/preloader"
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Package .levipack
+        run: |
+          mkdir -p dist/ray-sun
+          cp manifest.json dist/ray-sun/
+          cp build/out/arm64-v8a/libray_sun.so dist/ray-sun/
+          (cd dist/ray-sun && zip -r ../ray-sun.levipack .)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ray-sun
+          path: |
+            dist/ray-sun.levipack
+            dist/ray-sun/libray_sun.so
