@@ -216,6 +216,24 @@ inline void buildBeams(std::vector<V>& out, Vec3 center, const Basis& bs, float 
     }
 }
 
+// Versi garis dari sinar (mode aman): 2 vertex per sinar, pangkal terang -> ujung transparan.
+inline void buildBeamLines(std::vector<V>& out, Vec3 center, const Basis& bs, float D, Vec3 rgb, const BeamParams& p) {
+    for (int i = 0; i < p.count; ++i) {
+        const uint32_t ui = static_cast<uint32_t>(i);
+        const float jitter = (rnd01(p.seed, ui, 1) - 0.5f) * 0.8f;
+        const float ang = 2.0f * kPi * (static_cast<float>(i) + jitter) / static_cast<float>(p.count);
+        const float lenF = 0.55f + 0.95f * rnd01(p.seed, ui, 2);
+        const float strF = 0.35f + 0.65f * rnd01(p.seed, ui, 4);
+        const float phase = rnd01(p.seed, ui, 5) * 2.0f * kPi;
+        const float speed = 0.3f + 0.7f * rnd01(p.seed, ui, 6);
+        const float shimmer = 0.85f + 0.15f * std::sin(p.time * speed + phase);
+        const Vec3 dir = bs.r * std::cos(ang) + bs.u * std::sin(ang);
+        const float a0 = std::min(1.0f, p.alpha * 2.2f * strF * shimmer);
+        out.push_back(makeV(center + dir * (p.baseRadius * D), rgb, a0));
+        out.push_back(makeV(center + dir * (p.length * lenF * D), rgb, 0.0f));
+    }
+}
+
 // Posisi bintik flare pada garis dari matahari melewati tengah layar. k=1 di matahari,
 // k=0 di tengah layar, k<0 di sisi seberang. Hasil relatif kamera, jarak D.
 inline Vec3 ghostCenter(const Basis& cam, Vec3 sun, float k, float D) {

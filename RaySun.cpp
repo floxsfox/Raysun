@@ -146,6 +146,9 @@ struct Settings {
     std::atomic_int material{0};    // 0 = tertutup medan (depth), 1 = overlay
     std::atomic_int colorMode{0};   // 0 auto, 1 emas, 2 putih, 3 pink
     std::atomic_int timeOverride{0};
+    std::atomic_int rmode{0};    // 0 = quad lembut, 1 = garis aman
+    std::atomic_int penTime{0};  // 1 = fungsi waktu crash di sesi lalu -> tidak dipakai
+    std::atomic_int penDraw{0};  // 1 = gambar quad crash -> mode garis, 2 = gambar dimatikan
 };
 
 // Status matahari yang dihitung di thread update, dibaca thread render.
@@ -169,6 +172,7 @@ struct TimeProbe {
     uint32_t lastI = 0;
     float lastF = 0.f;
     Clock::time_point lastChange{};
+    Clock::time_point lastSample{};
 };
 
 struct Globals {
@@ -196,6 +200,9 @@ struct Globals {
     std::atomic_bool camValid{false};
 
     TimeProbe tp;
+    bool stageTimeStarted = false;
+    bool stageDrawStarted = false;
+    int drawFrames = 0;
     bool swapRot = false;
     int updateFaults = 0;
     std::atomic_bool updateBroken{false};
@@ -228,6 +235,8 @@ ll::mod::NativeMod *gSelf = nullptr;
 
 #define VO_INFO(...) do { if (gSelf) gSelf->getLogger().info(__VA_ARGS__); } while (0)
 #define VO_WARN(...) do { if (gSelf) gSelf->getLogger().warn(__VA_ARGS__); } while (0)
+
+void stageSet(const char *name); // penanda langkah berisiko (didefinisikan di bawah)
 
 float nowSec() { return std::chrono::duration<float>(Clock::now() - g.t0).count(); }
 
@@ -351,6 +360,23 @@ bool sampleTime(void *level, uint32_t &iv, float &fv) {
     return true;
 }
 
+// Setelah mode terkunci: hanya panggil satu bentuk fungsi waktu.
+bool sampleTimeMode(void *level, int mode, uint32_t &iv, float &fv) {
+    uint32_t i = 0;
+    float f = 0.f;
+    const bool ok = vo::engine::guarded([&] {
+        if (mode == 1) i = g.timeInt(level);
+        else f = g.timeFloat(level);
+    });
+    if (!ok) {
+        onUpdateFault("fungsi waktu");
+        return false;
+    }
+    if (mode == 1) iv = i;
+    else fv = f;
+    return true;
+}
+
 bool tickDeltaOk(double delta, double dt) {
     const double expected = dt * 20.0;
     return delta >= expected * 0.4 && delta <= expected * 1.8 + 2.0;
@@ -361,10 +387,20 @@ bool probeTime(void *level) {
     TimeProbe &tp = g.tp;
     if (tp.mode > 0) return true;
     if (tp.mode < 0) return false;
+    {   // jangan memanggil fungsi game tiap frame: satu sampel per selang probe
+        const auto t = Clock::now();
+        if (tp.havePrev && std::chrono::duration<double>(t - tp.prevT).count() < g.probeIntervalSec) return false;
+    }
+    if (!g.stageTimeStarted) {
+        g.stageTimeStarted = true;
+        stageSet("time"); // kalau game crash di sini, sesi berikutnya fungsi waktu tidak dipakai
+        vo::engine::trace("probe waktu: memanggil fungsi game");
+    }
     uint32_t iv = 0;
     float fv = 0.f;
     if (!sampleTime(level, iv, fv)) {
         tp.mode = -1;
+        stageSet("ok");
         VO_WARN("Fungsi waktu error saat probe, pakai 'Time preview' manual");
         return false;
     }
@@ -403,6 +439,7 @@ bool probeTime(void *level) {
         if (lock == 0) {
             if (tp.attempts >= 12) {
                 tp.mode = -1;
+                stageSet("ok");
                 VO_WARN("Fungsi waktu tidak cocok (tidak ada nilai yang naik ~20/detik). Pakai 'Time preview' manual");
                 return false;
             }
@@ -413,6 +450,7 @@ bool probeTime(void *level) {
         }
     }
     tp.mode = lock;
+    stageSet("ok");
     vo::engine::trace("waktu terkunci mode " + std::to_string(lock));
     tp.lastI = iv;
     tp.lastF = fv;
@@ -430,26 +468,25 @@ bool currentTick(void *level, double &tick) {
     }
     if (!level || !probeTime(level)) return false;
     TimeProbe &tp = g.tp;
-    uint32_t iv = 0;
-    float fv = 0.f;
-    if (!sampleTime(level, iv, fv)) return false;
     const auto now = Clock::now();
-    if (tp.mode == 1) {
-        if (iv != tp.lastI) {
-            tp.lastI = iv;
-            tp.lastChange = now;
-        }
-        const double frac = std::min(1.0, std::chrono::duration<double>(now - tp.lastChange).count() * 20.0);
-        tick = static_cast<double>(iv) + frac;
-    } else {
-        if (fv != tp.lastF) {
+    if (now - tp.lastSample >= std::chrono::milliseconds(50)) { // fungsi game dipanggil paling sering 20x/detik
+        tp.lastSample = now;
+        uint32_t iv = tp.lastI;
+        float fv = tp.lastF;
+        if (!sampleTimeMode(level, tp.mode, iv, fv)) return false;
+        if (tp.mode == 1) {
+            if (iv != tp.lastI) {
+                tp.lastI = iv;
+                tp.lastChange = now;
+            }
+        } else if (fv != tp.lastF) {
             tp.lastF = fv;
             tp.lastChange = now;
         }
-        const double base = (tp.mode == 2) ? static_cast<double>(fv) * 24000.0 : static_cast<double>(fv);
-        const double frac = std::min(1.0, std::chrono::duration<double>(now - tp.lastChange).count() * 20.0);
-        tick = base + frac;
     }
+    const double frac = std::min(1.0, std::chrono::duration<double>(now - tp.lastChange).count() * 20.0);
+    if (tp.mode == 1) tick = static_cast<double>(tp.lastI) + frac;
+    else tick = ((tp.mode == 2) ? static_cast<double>(tp.lastF) * 24000.0 : static_cast<double>(tp.lastF)) + frac;
     return std::isfinite(tick);
 }
 
@@ -654,6 +691,23 @@ struct ShaderColorGuard {
 std::vector<ray::V> gBatchA; // glow + sinar
 std::vector<ray::V> gBatchB; // flare
 
+// Mode aman: LineList (mode primitif 4, sama dengan Visual Outline).
+void submitLines(void *tess, void *screenContext, void *material, const std::vector<ray::V> &v) {
+    constexpr size_t kMaxVerts = 4096;
+    for (size_t first = 0; first < v.size(); first += kMaxVerts) {
+        const size_t n = std::min(kMaxVerts, v.size() - first);
+        g.tessBegin(tess, nullptr, 4, static_cast<int>(n), 0);
+        for (size_t i = 0; i < n; ++i) {
+            const ray::V &p = v[first + i];
+            g.tessColor(tess, p.c[0], p.c[1], p.c[2], p.c[3]);
+            g.tessVertex(tess, p.p[0], p.p[1], p.p[2]);
+        }
+        char pad[0x58];
+        std::memset(pad, 0, sizeof(pad));
+        g.renderMesh(screenContext, tess, material, pad);
+    }
+}
+
 void submitQuads(void *tess, void *screenContext, void *material, const std::vector<ray::V> &v) {
     constexpr size_t kMaxVerts = 4096; // kelipatan 4
     for (size_t first = 0; first < v.size(); first += kMaxVerts) {
@@ -727,9 +781,10 @@ void drawCore(void *levelRenderer, void *screenContext) {
 
     gBatchA.clear();
     gBatchB.clear();
+    const bool lineMode = g.cfg.rmode.load() == 1 || g.cfg.penDraw.load() >= 1;
     const bool dbl = !overlayMode; // material depth bisa membuang sisi belakang
     if (strength >= 0.01f) {
-        if (g.cfg.glow.load()) {
+        if (g.cfg.glow.load() && !lineMode) {
             // glow lebih besar & hangat saat matahari rendah
             const float low = 1.f - ray::smoothstep(4.f, 40.f, s.elev);
             ray::buildGlow(gBatchA, sunPos, sb, D * (0.12f + 0.10f * low), tint, 0.30f * std::min(strength * 1.2f, 1.f), dbl);
@@ -741,12 +796,13 @@ void drawCore(void *levelRenderer, void *screenContext) {
             bp.width = 0.016f;
             bp.alpha = 0.34f * std::min(strength, 1.f);
             bp.time = t;
-            ray::buildBeams(gBatchA, sunPos, sb, D, tint, bp, dbl);
+            if (lineMode) ray::buildBeamLines(gBatchA, sunPos, sb, D, tint, bp);
+            else ray::buildBeams(gBatchA, sunPos, sb, D, tint, bp, dbl);
         }
     }
 
     // lens flare: hanya saat menatap matahari & matahari tidak tertutup
-    if (g.cfg.flare.load() && s.fwdValid) {
+    if (g.cfg.flare.load() && s.fwdValid && !lineMode) {
         const float facing = ray::flareFacing(s.sun, s.fwd);
         const float fi = static_cast<float>(g.cfg.flareInt.load()) / 100.f;
         const float flareStr = facing * s.vis * (1.f - s.rain) * fi * (0.45f + 0.55f * ray::smoothstep(0.f, 25.f, s.elev)) * ray::smoothstep(-6.f, 2.f, s.elev);
@@ -766,13 +822,19 @@ void drawCore(void *levelRenderer, void *screenContext) {
 
     // vertex relatif kamera: sudah relatif (arah * jarak) karena matriks dunia game berpusat di kamera
     ShaderColorGuard guard(screenContext);
+    if (!g.stageDrawStarted) {
+        g.stageDrawStarted = true;
+        stageSet("draw"); // kalau game crash saat menggambar, sesi berikutnya turun ke mode garis
+        vo::engine::trace(lineMode ? "gambar pertama (mode garis)" : "gambar pertama (mode quad)");
+    }
     size_t drawn = 0;
     if (!gBatchA.empty()) {
         void *m = getMat(overlayMode ? 1 : 0);
         if (!m) m = getMat(1);
         if (m) {
-            submitQuads(tessPtr, screenContext, m, gBatchA);
-            drawn += gBatchA.size() / 4;
+            if (lineMode) submitLines(tessPtr, screenContext, m, gBatchA);
+            else submitQuads(tessPtr, screenContext, m, gBatchA);
+            drawn += gBatchA.size() / (lineMode ? 2 : 4);
         }
     }
     if (!gBatchB.empty()) {
@@ -782,7 +844,13 @@ void drawCore(void *levelRenderer, void *screenContext) {
             drawn += gBatchB.size() / 4;
         }
     }
-    if (drawn && !g.loggedFirstDraw.exchange(true)) VO_INFO("Gambar pertama: {} quad", drawn);
+    if (drawn) {
+        if (!g.loggedFirstDraw.exchange(true)) VO_INFO("Gambar pertama: {} elemen", drawn);
+        if (++g.drawFrames == 120) { // 120 frame aman -> tidak ada penalti sesi depan
+            stageSet("ok");
+            vo::engine::trace("gambar stabil 120 frame");
+        }
+    }
 }
 
 void renderLevelHook(void *self, void *screenContext, void *a3) {
@@ -837,6 +905,15 @@ bool applyKey(std::string_view key, std::string_view value) {
     else if (key == "material") c.material = std::clamp(parseInt(value, c.material.load()), 0, 1);
     else if (key == "color") c.colorMode = std::clamp(parseInt(value, c.colorMode.load()), 0, 3);
     else if (key == "time") c.timeOverride = std::clamp(parseInt(value, c.timeOverride.load()), 0, 24000);
+    else if (key == "rmode") c.rmode = std::clamp(parseInt(value, c.rmode.load()), 0, 1);
+    else if (key == "pentime") c.penTime = std::clamp(parseInt(value, c.penTime.load()), 0, 1);
+    else if (key == "pendraw") c.penDraw = std::clamp(parseInt(value, c.penDraw.load()), 0, 2);
+    else if (key == "retry") {
+        if (parseBool(value, false)) { // coba lagi fitur yang dimatikan setelah crash
+            c.penTime = 0;
+            c.penDraw = 0;
+        }
+    }
     else return false;
     return true;
 }
@@ -898,6 +975,9 @@ void saveConfig() {
     put("material", std::to_string(c.material.load()));
     put("color", std::to_string(c.colorMode.load()));
     put("time", std::to_string(c.timeOverride.load()));
+    put("rmode", std::to_string(c.rmode.load()));
+    put("pentime", std::to_string(c.penTime.load()));
+    put("pendraw", std::to_string(c.penDraw.load()));
     for (const auto &path : configCandidates()) {
         const size_t slash = path.find_last_of('/');
         if (slash != std::string::npos) ::mkdir(path.substr(0, slash).c_str(), 0771);
@@ -907,6 +987,36 @@ void saveConfig() {
         std::fclose(f);
         return;
     }
+}
+
+std::string stageFile() {
+    const auto c = configCandidates();
+    if (c.empty()) return {};
+    std::string p = c.front();
+    const size_t dot = p.rfind(".cfg");
+    if (dot != std::string::npos) p.replace(dot, 4, ".stage");
+    return p;
+}
+
+void stageSet(const char *name) {
+    const std::string path = stageFile();
+    if (path.empty()) return;
+    if (FILE *f = std::fopen(path.c_str(), "wb")) {
+        std::fputs(name, f);
+        std::fclose(f);
+    }
+}
+
+std::string stageGet() {
+    const std::string path = stageFile();
+    char buf[16] = {0};
+    if (path.empty()) return {};
+    if (FILE *f = std::fopen(path.c_str(), "rb")) {
+        const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+        std::fclose(f);
+        buf[n] = '\0';
+    }
+    return std::string(buf);
 }
 
 void onModuleToggle(std::string_view moduleId, bool enabled) {
@@ -941,6 +1051,21 @@ public:
         vo::engine::trace("enable");
         self.getLogger().info("Ray Sun v{} by {}", kVersion, kCredit);
         loadConfig();
+        {   // crash di sesi lalu? langkah berisiko yang terakhir berjalan diberi penalti
+            const std::string st = stageGet();
+            stageSet("ok");
+            if (st == "time") {
+                g.cfg.penTime = 1;
+                vo::engine::trace("sesi lalu crash saat probe waktu -> fungsi waktu game dimatikan");
+                self.getLogger().warn("Sesi lalu crash di fungsi waktu: dimatikan, pakai 'Time preview' atau tombol Retry");
+                saveConfig();
+            } else if (st == "draw") {
+                g.cfg.penDraw = std::min(2, g.cfg.penDraw.load() + 1);
+                vo::engine::trace("sesi lalu crash saat menggambar -> turun mode");
+                self.getLogger().warn("Sesi lalu crash saat menggambar: turun ke mode garis (atau dimatikan jika berulang)");
+                saveConfig();
+            }
+        }
 
         using pl::modmenu::ConfigType;
         auto on = [](bool v) { return std::string(v ? "true" : "false"); };
@@ -963,6 +1088,8 @@ public:
                 .config("color", "Ray color (0 auto, 1 gold, 2 white, 3 pink)", ConfigType::SliderInt, num(c.colorMode.load()), "0", "3")
                 .config("material", "Material (0 hidden by terrain, 1 overlay)", ConfigType::SliderInt, num(c.material.load()), "0", "1")
                 .config("time", "Time preview (0 = real time, 12000 = sunset)", ConfigType::SliderInt, num(c.timeOverride.load()), "0", "24000")
+                .config("rmode", "Render mode (0 soft quads, 1 safe lines)", ConfigType::SliderInt, num(c.rmode.load()), "0", "1")
+                .config("retry", "Retry features disabled after a crash", ConfigType::Toggle, "false")
                 .config("flip", "Flip flare (if dots are mirrored)", ConfigType::Toggle, on(c.flip.load()))
                 .config("debug", "Debug log", ConfigType::Toggle, on(c.debug.load()))
                 .onConfigChanged(onConfigChanged)
@@ -975,6 +1102,8 @@ public:
                                               reinterpret_cast<void **>(&g.origUpdate));
         g.renderHook = pl::memory::HookHandle(reinterpret_cast<void *>(mRenderTarget), reinterpret_cast<void *>(&renderLevelHook),
                                               reinterpret_cast<void **>(&g.origRender));
+        if (g.cfg.penTime.load()) g.tp.mode = -1;       // fungsi waktu crash di sesi lalu
+        if (g.cfg.penDraw.load() >= 2) g.drawBroken = true; // gambar crash berulang
         g.ready = g.updateHook.installed() && g.renderHook.installed();
         vo::engine::trace(g.ready ? "hook terpasang" : "hook GAGAL");
         if (g.ready) self.getLogger().info("Hook terpasang (update + renderLevel)");

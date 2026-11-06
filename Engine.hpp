@@ -111,18 +111,43 @@ inline void faultHandler(int sig, siginfo_t *info, void *ctx) {
     signal(sig, SIG_DFL); // return -> instruksi yang sama fault lagi -> crash normal
 }
 
-inline bool installFaultGuard() {
-    if (g_guardInstalled.exchange(true)) return true;
-    struct sigaction sa;
+inline void makeGuardAction(struct sigaction &sa) {
     std::memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = faultHandler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+}
+
+inline bool installFaultGuard() {
+    if (g_guardInstalled.exchange(true)) return true;
+    struct sigaction sa;
+    makeGuardAction(sa);
     const bool ok = sigaction(SIGSEGV, &sa, &g_oldSegv) == 0 && sigaction(SIGBUS, &sa, &g_oldBus) == 0;
     return ok;
 }
 
+// Library lain (crash reporter, game) bisa memasang handler SIGSEGV sesudah kita dan jadi
+// handler pertama, sehingga pengaman kita tidak pernah jalan. Sebelum tiap bagian yang dijaga,
+// pastikan handler kita yang terdepan; handler yang menggantikan dijadikan "lama" (diteruskan).
+inline void ensureGuardFirst() {
+    if (!g_guardInstalled.load()) return;
+    struct sigaction cur;
+    if (sigaction(SIGSEGV, nullptr, &cur) == 0 && !((cur.sa_flags & SA_SIGINFO) && cur.sa_sigaction == faultHandler)) {
+        g_oldSegv = cur;
+        struct sigaction sa;
+        makeGuardAction(sa);
+        sigaction(SIGSEGV, &sa, nullptr);
+    }
+    if (sigaction(SIGBUS, nullptr, &cur) == 0 && !((cur.sa_flags & SA_SIGINFO) && cur.sa_sigaction == faultHandler)) {
+        g_oldBus = cur;
+        struct sigaction sa;
+        makeGuardAction(sa);
+        sigaction(SIGBUS, &sa, nullptr);
+    }
+}
+
 inline bool runGuarded(void (*fn)(void *), void *arg) {
+    ensureGuardFirst();
     sigjmp_buf jb;
     if (sigsetjmp(jb, 0) != 0) {
         g_tlsJmp = nullptr;
