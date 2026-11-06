@@ -212,6 +212,12 @@ struct Globals {
 
     MaterialPtr mat[2];
     int matFetchFails[2] = {0, 0};
+    std::atomic<int64_t> lastRenderMs{0};
+    std::atomic<int64_t> streakStartMs{0};
+    std::atomic<uint32_t> epoch{0};
+    uint32_t updateEpoch = 0;
+    uint32_t drawEpoch = 0;
+    uint32_t loggedReadyEpoch = 0;
     std::atomic_bool loggedFirstDraw{false};
     pl::memory::HookHandle updateHook;
     pl::memory::HookHandle renderHook;
@@ -225,6 +231,34 @@ ll::mod::NativeMod *gSelf = nullptr;
 
 float nowSec() { return std::chrono::duration<float>(Clock::now() - g.t0).count(); }
 
+int64_t nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+}
+
+constexpr int64_t kUpdateGraceMs = 3000; // tunggu setelah dunia mulai dirender sebelum memanggil fungsi game
+constexpr int64_t kDrawGraceMs = 2000;
+
+// Dipanggil dari hook renderLevel tiap frame. renderLevel hanya jalan saat dunia benar-benar
+// ditampilkan; celah > 700 ms (layar loading, ganti dimensi, keluar dunia) = dunia baru.
+void noteRenderFrame() {
+    const int64_t now = nowMs();
+    const int64_t last = g.lastRenderMs.load(std::memory_order_relaxed);
+    if (last == 0 || now - last > 700) {
+        g.streakStartMs.store(now, std::memory_order_relaxed);
+        g.epoch.fetch_add(1, std::memory_order_relaxed);
+        vo::engine::trace("render: dunia baru terdeteksi, menunggu stabil");
+    }
+    g.lastRenderMs.store(now, std::memory_order_relaxed);
+}
+
+bool worldReady(int64_t graceMs) {
+    const int64_t now = nowMs();
+    const int64_t last = g.lastRenderMs.load(std::memory_order_relaxed);
+    if (last == 0 || now - last > 400) return false;
+    return now - g.streakStartMs.load(std::memory_order_relaxed) >= graceMs;
+}
+
+
 SunState currentState() {
     std::lock_guard<std::mutex> lock(g.stMutex);
     return g.state;
@@ -237,6 +271,7 @@ void setState(const SunState &s) {
 // ---------------------------------------------------------------- panggilan game aman
 void onUpdateFault(const char *where) {
     ++g.updateFaults;
+    vo::engine::trace(std::string("fault update di ") + where);
     VO_WARN("Error tertangkap di {} (ke-{})", where, g.updateFaults);
     SunState s;
     setState(s);
@@ -378,6 +413,7 @@ bool probeTime(void *level) {
         }
     }
     tp.mode = lock;
+    vo::engine::trace("waktu terkunci mode " + std::to_string(lock));
     tp.lastI = iv;
     tp.lastF = fv;
     tp.lastChange = now;
@@ -477,8 +513,26 @@ bool sunVisible(void *bs, ray::Vec3 sun, bool &ok) {
     return true;
 }
 
+// Bersihkan semua cache yang terikat ke satu dunia.
+void resetWorldState() {
+    setState(SunState{});
+    g.clearBlock.clear();
+    g.visSmooth = 1.f;
+    g.nextOcc = Clock::time_point{};
+}
+
 void updateTick() {
     if (!g.cfg.moduleOn.load() || g.updateBroken.load()) return;
+    const uint32_t ep = g.epoch.load(std::memory_order_relaxed);
+    if (ep != g.updateEpoch) { // dunia baru / selesai loading: buang cache lama
+        g.updateEpoch = ep;
+        resetWorldState();
+    }
+    if (!worldReady(kUpdateGraceMs)) return; // jangan sentuh fungsi game saat dunia masih dimuat
+    if (g.loggedReadyEpoch != ep) {
+        g.loggedReadyEpoch = ep;
+        vo::engine::trace("dunia siap, Ray Sun mulai membaca waktu");
+    }
     void *ci = g.clientInstance.load();
     if (!ci) return;
 
@@ -639,6 +693,15 @@ void drawCore(void *levelRenderer, void *screenContext) {
     vo::engine::safeRead(reinterpret_cast<void *>(lrp + kLrpFogColorR), fog, sizeof(fog));
     g.fogEnd.store(fogEnd, std::memory_order_relaxed);
 
+    const uint32_t ep = g.epoch.load(std::memory_order_relaxed);
+    if (ep != g.drawEpoch) { // material lama bisa tidak valid setelah resource/shader dimuat ulang
+        g.drawEpoch = ep;
+        g.mat[0] = MaterialPtr{};
+        g.mat[1] = MaterialPtr{};
+        g.matFetchFails[0] = g.matFetchFails[1] = 0;
+    }
+    if (!worldReady(kDrawGraceMs)) return; // tunggu dunia + material selesai dimuat
+
     const SunState s = currentState();
     if (!s.valid) return;
     // di bawah air / lava / buta, kabut sangat dekat: tidak digambar
@@ -723,6 +786,7 @@ void drawCore(void *levelRenderer, void *screenContext) {
 }
 
 void renderLevelHook(void *self, void *screenContext, void *a3) {
+    noteRenderFrame();
     if (g.origRender) g.origRender(self, screenContext, a3);
     if (!g.cfg.moduleOn.load() || g.drawBroken.load() || !self || !screenContext) return;
     if (reinterpret_cast<uintptr_t>(screenContext) < 0x1000) return;
@@ -730,6 +794,7 @@ void renderLevelHook(void *self, void *screenContext, void *a3) {
         const bool ok = vo::engine::guarded([&] { drawCore(self, screenContext); });
         if (!ok) {
             ++g.drawFaults;
+            vo::engine::trace("fault saat gambar");
             VO_WARN("Error tertangkap saat menggambar (ke-{})", g.drawFaults);
             if (g.drawFaults >= 2) {
                 g.drawBroken = true;
@@ -872,6 +937,8 @@ public:
 
     bool enable() {
         auto &self = getSelf();
+        vo::engine::traceInit("ray_sun_trace.txt");
+        vo::engine::trace("enable");
         self.getLogger().info("Ray Sun v{} by {}", kVersion, kCredit);
         loadConfig();
 
@@ -909,6 +976,7 @@ public:
         g.renderHook = pl::memory::HookHandle(reinterpret_cast<void *>(mRenderTarget), reinterpret_cast<void *>(&renderLevelHook),
                                               reinterpret_cast<void **>(&g.origRender));
         g.ready = g.updateHook.installed() && g.renderHook.installed();
+        vo::engine::trace(g.ready ? "hook terpasang" : "hook GAGAL");
         if (g.ready) self.getLogger().info("Hook terpasang (update + renderLevel)");
         else self.getLogger().error("Hook gagal: update={} render={}", g.updateHook.installed(), g.renderHook.installed());
         return true;

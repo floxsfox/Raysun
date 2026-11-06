@@ -3,6 +3,8 @@
 #include <atomic>
 #include <csetjmp>
 #include <csignal>
+#include <cstdio>
+#include <ctime>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -12,6 +14,7 @@
 
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace vo::engine {
@@ -135,6 +138,45 @@ template <typename F>
 inline bool guarded(F &&f) {
     using Fn = std::remove_reference_t<F>;
     return runGuarded([](void *p) { (*static_cast<Fn *>(p))(); }, &f);
+}
+
+// ---------------------------------------------------------------------------
+// Jejak diagnostik: baris singkat ke file teks di folder Android/data (jarang, hanya saat
+// kejadian penting). Sesi sebelumnya disimpan sebagai <nama>.prev, jadi setelah crash
+// isi file .prev menunjukkan langkah terakhir sebelum game mati.
+inline std::string &tracePath() {
+    static std::string p;
+    return p;
+}
+
+inline void traceInit(const char *fileName) {
+    char buf[256] = {0};
+    size_t n = 0;
+    if (FILE *f = std::fopen("/proc/self/cmdline", "rb")) {
+        n = std::fread(buf, 1, sizeof(buf) - 1, f);
+        std::fclose(f);
+    }
+    buf[n] = '\0';
+    const std::string pkg(buf);
+    if (pkg.empty()) return;
+    const std::string dir = "/storage/emulated/0/Android/data/" + pkg + "/files";
+    ::mkdir(dir.c_str(), 0771);
+    const std::string path = dir + "/" + fileName;
+    std::rename(path.c_str(), (path + ".prev").c_str());
+    if (FILE *t = std::fopen(path.c_str(), "w")) {
+        std::fputs("trace start\n", t);
+        std::fclose(t);
+        tracePath() = path;
+    }
+}
+
+inline void trace(const std::string &line) {
+    static std::atomic<int> count{0};
+    if (tracePath().empty() || count.fetch_add(1) > 400) return;
+    if (FILE *t = std::fopen(tracePath().c_str(), "a")) {
+        std::fprintf(t, "%lld %s\n", static_cast<long long>(std::time(nullptr)), line.c_str());
+        std::fclose(t);
+    }
 }
 
 } // namespace vo::engine
